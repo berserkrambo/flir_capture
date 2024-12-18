@@ -253,3 +253,9 @@ if __name__ == '__main__':
 
     trigger_capture(exposure=exposure, gain=gain, capture_mode=trigger, use_socket=use_socket)
     # echo -n "cattura" | nc localhost 12345
+
+    # cams = FlirWrapper(exposure=exposure, gain=gain, capture_mode=capture_mode)
+    # data = cams.get_frames()
+    # for cam_id, frame in data:
+    #     ... do something..
+    # cams.stop() or cam.release() if you don't forget....
