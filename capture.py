@@ -9,23 +9,33 @@ import numpy as np
 import socket
 import pickle
 
+from flir_utils import print_device_info
+
 
 class FlirCamera(threading.Thread):
     def __init__(self, camera, exposure, gain, capture_mode):
         super().__init__()
-        print("init")
         self.cam = camera
 
-        self.terminate = threading.Event()
+        self.terminate = False
         self.capture_mode = capture_mode
+        self.trigger_sw = threading.Event()
+        self.acquired = threading.Event()
 
+        self.lock = Lock()
         # self.queue = queue
         self.exposure = exposure
         self.gain = gain
         self.width = None
         self.height = None
+        self.channels = None
         self.last_frame = None
         self.cam_id = None
+        self.nodemap = None
+
+        self.image_processor = PySpin.ImageProcessor()
+
+        self.trigger_sw.set()
 
     def get_camera_resolution(self):
         """
@@ -71,15 +81,14 @@ class FlirCamera(threading.Thread):
     def load_defaults(self):
         self.cam.UserSetSelector.SetValue(PySpin.UserSetSelector_Default)
         self.cam.UserSetLoad.Execute()
+        self.cam.TriggerMode.SetValue(PySpin.TriggerMode_Off)
         self.setup_camera(self.exposure, self.gain)
         self.cam_id = self.cam.DeviceSerialNumber.ToString()
 
 
     def set_trigger_hw(self):
-
         self.load_defaults()
 
-        self.cam.TriggerMode.SetValue(PySpin.TriggerMode_Off)
         self.cam.TriggerSource.SetValue(PySpin.TriggerSource_Line0)
         self.cam.TriggerSelector.SetValue(PySpin.TriggerSelector_FrameStart)
         # self.cam.TriggerActivation.SetValue(PySpin.TriggerActivation_RisingEdge)
@@ -90,10 +99,7 @@ class FlirCamera(threading.Thread):
 
 
     def set_trigger_sw(self):
-
         self.load_defaults()
-
-        self.cam.TriggerMode.SetValue(PySpin.TriggerMode_Off)
         self.cam.TriggerSource.SetValue(PySpin.TriggerSource_Software)
         self.cam.TriggerSelector.SetValue(PySpin.TriggerSelector_FrameStart)
         self.cam.TriggerMode.SetValue(PySpin.TriggerMode_On)
@@ -102,34 +108,26 @@ class FlirCamera(threading.Thread):
 
 
     def set_continuous(self):
-
         self.load_defaults()
-        self.cam.TriggerMode.SetValue(PySpin.TriggerMode_Off)
-
         self.capture_mode = "continuous"
 
 
     def get_frame(self):
-        if self.capture_mode == "trigger_sw":
-            self.cam.TriggerSoftware.Execute()
+        with self.lock:
+            if self.capture_mode == "trigger_sw":
+                self.acquired.wait()
+                self.acquired.clear()
+                self.trigger_sw.set()
 
-        frame = self.cam.GetNextImage()
-        status = not frame.IsIncomplete()
-        if status:
-            self.last_frame = frame.GetNDArray()
-        else:
-            self.last_frame = None
-        frame.Release()
-
-        if self.capture_mode != "continuous":
-            print(self.cam_id, status)
-
-        return self.cam_id, self.last_frame
+            return self.cam_id, self.last_frame
 
     def run(self):
+        # Retrieve TL device nodemap and print device information
+        # nodemap_tldevice = self.cam.GetTLDeviceNodeMap()
+        # print_device_info(nodemap_tldevice)
+
         self.cam.Init()
         self.width, self.height = self.get_camera_resolution()
-        print(self.cam_id, self.width, self.height)
 
         if self.capture_mode == "continuous":
             self.set_continuous()
@@ -138,14 +136,42 @@ class FlirCamera(threading.Thread):
         elif self.capture_mode == "trigger_hw":
             self.set_trigger_hw()
 
+        print(self.cam_id, self.width, self.height)
+        self.cam.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)    # va sempre continuous anche col trigger
         self.cam.BeginAcquisition()
-        self.terminate.wait()
+
+        while not self.terminate:
+            if self.capture_mode == "trigger_sw":
+                self.trigger_sw.wait()
+                self.cam.TriggerSoftware.Execute()
+                frame = self.cam.GetNextImage()
+            elif self.capture_mode in ["continuous", "trigger_hw"]:
+                frame = self.cam.GetNextImage()
+
+            status = not frame.IsIncomplete()
+
+            with self.lock:
+                if status:
+                    self.last_frame = frame.GetData().reshape(self.height, self.width, -1)
+                else:
+                    self.last_frame = None
+            frame.Release()
+
+            if self.capture_mode == "trigger_sw":
+                self.trigger_sw.clear()
+                self.acquired.set()
+
+            if self.capture_mode != "continuous":
+                print(self.cam_id, status)
 
         self.cam.EndAcquisition()
+        self.load_defaults()
         self.cam.DeInit()
 
     def release(self):
-        self.terminate.set()
+        self.terminate = True
+        if self.capture_mode == "trigger_sw" and not self.trigger_sw.is_set():
+            self.trigger_sw.set()
 
     def stop(self):
         self.release()
@@ -159,8 +185,8 @@ class FlirWrapper():
         self.capture_mode = capture_mode
         self.system = PySpin.System.GetInstance()
 
-        camera_list = self.system.GetCameras()
-        self.caps = [FlirCamera(cam, exposure, gain, self.capture_mode) for i, cam in enumerate(camera_list)]
+        self.camera_list = self.system.GetCameras()
+        self.caps = [FlirCamera(cam, exposure, gain, self.capture_mode) for i, cam in enumerate(self.camera_list)]
 
         [c.start() for c in self.caps]
         print("cam started, sleeping 2 sec to be ready...")
@@ -174,6 +200,8 @@ class FlirWrapper():
     def release(self):
         [c.release() for c in self.caps]
         [c.join() for c in self.caps]
+        del self.caps
+        self.camera_list.Clear()
         self.system.ReleaseInstance()
 
     def stop(self):
@@ -183,79 +211,40 @@ class FlirWrapper():
         self.release()
 
 
-def trigger_capture(exposure, gain, capture_mode, use_socket):
-    assert capture_mode in ["trigger_hw", "trigger_sw"]
+def main(exposure, gain, capture_mode):
+    assert capture_mode in ["trigger_hw", "trigger_sw", "continuous"]
     cams = FlirWrapper(exposure=exposure, gain=gain, capture_mode=capture_mode)
 
-    if use_socket:
-        # Crea una socket TCP/IP
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Associa la socket all'indirizzo IP e alla porta
-        server_address = ('localhost', 12345)
-        server_socket.bind(server_address)
-        # Ascolta le connessioni in arrivo (massimo 1 client)
-        server_socket.listen(1)
-        print("Server in ascolto su porta 12345...")
+    data_out = {}
 
-        while True:
-            # Accetta una connessione
-            connection, client_address = server_socket.accept()
-            try:
-                print(f"Connessione accettata da {client_address}")
-                # Riceve i dati dal client
-                data = connection.recv(1024).decode()  # Il messaggio inviato dal client
-
-                if data.strip().lower() == "cattura":
-                    print("Ricevuto comando 'cattura', eseguo la funzione...")
-
-                    data = cams.get_frames()
-                    data_out = {}
-                    for cam_id, frame in data:
-                        # Codifica l'immagine come PNG in memoria
-                        if frame is not None:
-                            cv2.imwrite(Path(".") / f"{cam_id}.png", frame)
-                            _, buffer = cv2.imencode('.png', frame)
-                            data_out[cam_id] = buffer.tobytes()
-                        else:
-                            data_out[cam_id] = None
-
-                    data_out = pickle.dumps(data_out)
-
-                    # Invia i dati serializzati al client
-                    connection.sendall(data_out)
-                else:
-                    print(f"Comando sconosciuto: {data}")
-                    connection.sendall(b"Comando sconosciuto.\n")
-            finally:
-                # Chiude la connessione
-                connection.close()
-
-    else:
+    while True:
+        t0 = time.time()
         data = cams.get_frames()
-        data_out = {}
-        for cam_id, frame in data:
-            # Codifica l'immagine come PNG in memoria
-            if frame is not None:
-                cv2.imwrite(Path(".") / f"{cam_id}.png", frame)
-                _, buffer = cv2.imencode('.png', frame)
-                data_out[cam_id] = buffer.tobytes()
-            else:
-                data_out[cam_id] = None
+        cam_id, frame = data[0]
 
-    return pickle.dumps(data_out)
+        if frame is not None:
+            cv2.imshow("", frame)
+            _, buffer = cv2.imencode('.png', frame)
+            data_out[cam_id] = buffer.tobytes()
+        else:
+            data_out[cam_id] = None
 
+        k = cv2.waitKey(1) if capture_mode == "continuous" else cv2.waitKey(0)
+
+        if k == 27 or k == ord('q'):
+            break
+
+        t1 = time.time()
+        print(f"\rfps: {int(1/(t1-t0)):03d}", end="")
 
 if __name__ == '__main__':
-    use_socket = False
-    trigger = 'trigger_hw'  # trigger_hw - trigger_sw
-    exposure = 55
+
+    import time
+
+    # capture_mode = 'continuous'  # trigger_hw - trigger_sw
+    capture_mode = 'trigger_sw'
+    exposure = 800
     gain = 10
 
-    trigger_capture(exposure=exposure, gain=gain, capture_mode=trigger, use_socket=use_socket)
-    # echo -n "cattura" | nc localhost 12345
+    main(exposure=exposure, gain=gain, capture_mode=capture_mode)
 
-    # cams = FlirWrapper(exposure=exposure, gain=gain, capture_mode=capture_mode)
-    # data = cams.get_frames()
-    # for cam_id, frame in data:
-    #     ... do something..
-    # cams.stop() or cam.release() if you don't forget....
