@@ -17,12 +17,10 @@ class FlirCamera(threading.Thread):
         super().__init__()
         self.cam = camera
 
-        self.terminate = False
         self.capture_mode = capture_mode
-        self.trigger_sw = threading.Event()
-        self.acquired = threading.Event()
+        self.terminate = threading.Event()
 
-        self.lock = Lock()
+        # self.lock = Lock()
         # self.queue = queue
         self.exposure = exposure
         self.gain = gain
@@ -35,7 +33,6 @@ class FlirCamera(threading.Thread):
 
         self.image_processor = PySpin.ImageProcessor()
 
-        self.trigger_sw.set()
 
     def get_camera_resolution(self):
         """
@@ -85,7 +82,6 @@ class FlirCamera(threading.Thread):
         self.setup_camera(self.exposure, self.gain)
         self.cam_id = self.cam.DeviceSerialNumber.ToString()
 
-
     def set_trigger_hw(self):
         self.load_defaults()
 
@@ -96,7 +92,6 @@ class FlirCamera(threading.Thread):
         self.cam.TriggerMode.SetValue(PySpin.TriggerMode_On)
 
         self.capture_mode = "trigger_hw"
-
 
     def set_trigger_sw(self):
         self.load_defaults()
@@ -113,13 +108,22 @@ class FlirCamera(threading.Thread):
 
 
     def get_frame(self):
-        with self.lock:
-            if self.capture_mode == "trigger_sw":
-                self.acquired.wait()
-                self.acquired.clear()
-                self.trigger_sw.set()
+        if self.capture_mode == "trigger_sw":
+            self.cam.TriggerSoftware.Execute()
 
-            return self.cam_id, self.last_frame
+        frame = self.cam.GetNextImage()
+        status = not frame.IsIncomplete()
+
+        if status:
+            self.last_frame = frame.GetData().reshape(self.height, self.width, -1)
+        else:
+            self.last_frame = None
+        frame.Release()
+
+        if self.capture_mode != "continuous":
+            print(self.cam_id, f"status: {status}")
+
+        return self.cam_id, self.last_frame
 
     def run(self):
         # Retrieve TL device nodemap and print device information
@@ -140,36 +144,14 @@ class FlirCamera(threading.Thread):
         self.cam.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)    # va sempre continuous anche col trigger
         self.cam.BeginAcquisition()
 
-        while not self.terminate:
-            if self.capture_mode == "trigger_sw":
-                self.trigger_sw.wait()
-                self.cam.TriggerSoftware.Execute()
-
-            frame = self.cam.GetNextImage()
-            status = not frame.IsIncomplete()
-
-            with self.lock:
-                if status:
-                    self.last_frame = frame.GetData().reshape(self.height, self.width, -1)
-                else:
-                    self.last_frame = None
-            frame.Release()
-
-            if self.capture_mode == "trigger_sw":
-                self.trigger_sw.clear()
-                self.acquired.set()
-
-            if self.capture_mode != "continuous":
-                print(self.cam_id, status)
+        self.terminate.wait()
 
         self.cam.EndAcquisition()
         self.load_defaults()
         self.cam.DeInit()
 
     def release(self):
-        self.terminate = True
-        if self.capture_mode == "trigger_sw" and not self.trigger_sw.is_set():
-            self.trigger_sw.set()
+        self.terminate.set()
 
     def stop(self):
         self.release()
@@ -233,7 +215,7 @@ def main(exposure, gain, capture_mode):
             break
 
         t1 = time.time()
-        # print(f"\rfps: {int(1/(t1-t0)):03d}", end="")
+        print(f"\rfps: {int(1/(t1-t0)):03d}", end="")
 
 if __name__ == '__main__':
 
