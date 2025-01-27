@@ -111,8 +111,11 @@ class FlirCamera(threading.Thread):
         if self.capture_mode == "trigger_sw":
             self.cam.TriggerSoftware.Execute()
 
-        frame = self.cam.GetNextImage()
-        status = not frame.IsIncomplete()
+        try:
+            frame = self.cam.GetNextImage(1000)
+            status = not frame.IsIncomplete()
+        except:
+            status = False
 
         if status:
             self.last_frame = frame.GetData().reshape(self.height, self.width, -1)
@@ -127,8 +130,8 @@ class FlirCamera(threading.Thread):
 
     def run(self):
         # Retrieve TL device nodemap and print device information
-        # nodemap_tldevice = self.cam.GetTLDeviceNodeMap()
-        # print_device_info(nodemap_tldevice)
+        nodemap_tldevice = self.cam.GetTLDeviceNodeMap()
+        print_device_info(nodemap_tldevice)
 
         self.cam.Init()
         self.width, self.height = self.get_camera_resolution()
@@ -221,8 +224,8 @@ if __name__ == '__main__':
 
     import time
 
-    # capture_mode = 'continuous'  # trigger_hw - trigger_sw
-    capture_mode = 'trigger_sw'
+    capture_mode = 'continuous'  # trigger_hw - trigger_sw
+    # capture_mode = 'trigger_sw'
     exposure = 800
     gain = 10
 

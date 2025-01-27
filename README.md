@@ -4,7 +4,10 @@ Questo repository fornisce un wrapper per l'acquisizione di immagini utilizzando
 
 Il progetto è progettato per semplificare l'uso delle telecamere FLIR e integra funzionalità avanzate come la configurazione automatica della telecamera, la gestione di thread multipli e l'acquisizione di immagini in tempo reale.
 
----
+Dagli script ufficiali si nota un comportamento non corretto con l'utilizzo del trigger software:
+```python            
+# TODO: Blackfly and Flea3 GEV cameras need 2 second delay after software trigger
+```
 
 ## Caratteristiche principali
 
@@ -26,8 +29,6 @@ Il progetto è progettato per semplificare l'uso delle telecamere FLIR e integra
   - `opencv-python`
   - `numpy`
   - `path`
-  - `socket`
-  - `pickle`
 - Un sistema compatibile con le telecamere FLIR e il framework Spinnaker SDK.
 
 ---
@@ -36,16 +37,21 @@ Il progetto è progettato per semplificare l'uso delle telecamere FLIR e integra
 
 1. Clonare il repository:
     ```bash
-    git clone https://github.com/tuo-utente/flir-camera-wrapper.git
-    cd flir-camera-wrapper
+    git clone https://github.com/berserkrambo/flir_capture.git
+    cd flir_capture
     ```
 2. Installare le dipendenze:
     ```bash
     pip install -r requirements.txt
     ```
-3. Verificare che il framework Spinnaker SDK sia correttamente installato sul sistema.
-
----
+3. Scaricare e installare le SDK di sistema: 
+   ```bash
+     spinnaker-4.2.0.46-amd64-22.04-pkg.tar.gz
+     ```
+      e il wrapper python :
+    ```bash
+       spinnaker_python-4.2.0.46-cp310-cp310-linux_x86_64-22.04
+    ```
 
 ## Esempio di utilizzo
 
@@ -54,7 +60,6 @@ Il progetto è progettato per semplificare l'uso delle telecamere FLIR e integra
 Un esempio di utilizzo del wrapper per avviare l'acquisizione in modalità continua:
 
 ```python
-from flir_camera_wrapper import main
 
 # Parametri di configurazione
 exposure = 800  # Tempo di esposizione in microsecondi
@@ -63,3 +68,4 @@ capture_mode = 'continuous'  # Modalità di acquisizione: continuous, trigger_hw
 
 # Avvia l'acquisizione
 main(exposure=exposure, gain=gain, capture_mode=capture_mode)
+```
