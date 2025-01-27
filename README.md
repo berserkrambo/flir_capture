@@ -1,5 +1,4 @@
 # Creazione del contenuto del file README.md
-readme_content = """# Flir Camera Wrapper
 
 Questo repository fornisce un wrapper per l'acquisizione di immagini utilizzando telecamere FLIR tramite il framework PySpin. Supporta tre modalità di acquisizione: **continuous**, **trigger hardware (trigger_hw)** e **trigger software (trigger_sw)**. 
 
