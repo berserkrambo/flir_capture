@@ -144,10 +144,8 @@ class FlirCamera(threading.Thread):
             if self.capture_mode == "trigger_sw":
                 self.trigger_sw.wait()
                 self.cam.TriggerSoftware.Execute()
-                frame = self.cam.GetNextImage()
-            elif self.capture_mode in ["continuous", "trigger_hw"]:
-                frame = self.cam.GetNextImage()
 
+            frame = self.cam.GetNextImage()
             status = not frame.IsIncomplete()
 
             with self.lock:
@@ -235,7 +233,7 @@ def main(exposure, gain, capture_mode):
             break
 
         t1 = time.time()
-        print(f"\rfps: {int(1/(t1-t0)):03d}", end="")
+        # print(f"\rfps: {int(1/(t1-t0)):03d}", end="")
 
 if __name__ == '__main__':
 
