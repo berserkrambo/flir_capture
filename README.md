@@ -1,9 +1,3 @@
-Certamente! Ecco il file `README.md` aggiornato per riflettere l'aggiunta della modalità `trigger_gated` e il refactoring dell'architettura a produttore-consumatore.
-
-Ho evidenziato le modifiche e aggiunto dettagli per rendere la documentazione più chiara e completa.
-
----
-
 # Flir Capture
 
 Questo repository fornisce un wrapper Python per l'acquisizione di immagini da telecamere FLIR utilizzando il framework PySpin. Il progetto è progettato per semplificare l'integrazione delle telecamere FLIR in applicazioni di visione artificiale, offrendo un'interfaccia di alto livello e gestendo la complessità della configurazione e dell'acquisizione multithread.
