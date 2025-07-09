@@ -20,30 +20,29 @@ class FlirCamera(threading.Thread):
         self.capture_mode = capture_mode
         self.terminate = threading.Event()
 
-        # Aggiungiamo un Lock per garantire l'accesso thread-safe all'ultimo frame
-        self.lock = Lock()
-
+        # self.lock = Lock()
+        # self.queue = queue
         self.exposure = exposure
         self.gain = gain
         self.width = None
         self.height = None
-
-        # Inizializziamo last_frame a None
+        self.channels = None
         self.last_frame = None
         self.cam_id = None
         self.nodemap = None
 
-        # ImageProcessor per la conversione del formato colore
         self.image_processor = PySpin.ImageProcessor()
-        # Imposta il formato di output desiderato, BGR8 è comodo per OpenCV
-        self.image_processor.SetColorProcessing(PySpin.SPINNAKER_COLOR_PROCESSING_ALGORITHM_HQ_LINEAR)
+
 
     def get_camera_resolution(self):
         """
         Ottiene i parametri di larghezza (Width) e altezza (Height) della camera direttamente.
         """
         try:
+            # Ottenere la mappa dei nodi della camera
             nodemap = self.cam.GetNodeMap()
+
+            # Ottenere i nodi Width e Height
             width_node = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
             height_node = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
 
@@ -76,11 +75,6 @@ class FlirCamera(threading.Thread):
         # Set gain to 'gain' dB
         self.cam.Gain.SetValue(gain)
 
-        # Imposta il formato pixel su uno comune, come BayerRG8 per le camere a colori
-        # Se le tue camere sono monocromatiche, potresti usare Mono8
-        if self.cam.PixelFormat.GetAccessMode() == PySpin.RW:
-            self.cam.PixelFormat.SetValue(PySpin.PixelFormat_BayerRG8)
-
     def load_defaults(self):
         self.cam.UserSetSelector.SetValue(PySpin.UserSetSelector_Default)
         self.cam.UserSetLoad.Execute()
@@ -90,10 +84,13 @@ class FlirCamera(threading.Thread):
 
     def set_trigger_hw(self):
         self.load_defaults()
+
         self.cam.TriggerSource.SetValue(PySpin.TriggerSource_Line0)
         self.cam.TriggerSelector.SetValue(PySpin.TriggerSelector_FrameStart)
+        # self.cam.TriggerActivation.SetValue(PySpin.TriggerActivation_RisingEdge)
         self.cam.TriggerActivation.SetValue(PySpin.TriggerActivation_FallingEdge)
         self.cam.TriggerMode.SetValue(PySpin.TriggerMode_On)
+
         self.capture_mode = "trigger_hw"
 
     def set_trigger_sw(self):
@@ -101,6 +98,7 @@ class FlirCamera(threading.Thread):
         self.cam.TriggerSource.SetValue(PySpin.TriggerSource_Software)
         self.cam.TriggerSelector.SetValue(PySpin.TriggerSelector_FrameStart)
         self.cam.TriggerMode.SetValue(PySpin.TriggerMode_On)
+
         self.capture_mode = "trigger_sw"
 
     # NUOVO METODO PER L'ACQUISIZIONE "GATED"
@@ -113,7 +111,6 @@ class FlirCamera(threading.Thread):
         self.cam.TriggerSource.SetValue(PySpin.TriggerSource_Line0)
         self.cam.TriggerSelector.SetValue(PySpin.TriggerSelector_FrameStart)
 
-        # La chiave è questa impostazione: la camera è attiva quando il livello è alto
         self.cam.TriggerActivation.SetValue(PySpin.TriggerActivation_LevelHigh)
 
         self.cam.TriggerMode.SetValue(PySpin.TriggerMode_On)
@@ -123,30 +120,36 @@ class FlirCamera(threading.Thread):
         self.load_defaults()
         self.capture_mode = "continuous"
 
-    def get_frame(self):
-        """
-        Metodo per il thread principale per ottenere l'ultimo frame catturato.
-        Restituisce una COPIA dell'ultimo frame per evitare race conditions.
-        """
-        with self.lock:
-            # Usiamo deepcopy per essere sicuri che il thread principale lavori
-            # su un'immagine che non verrà modificata dal thread di acquisizione.
-            last_frame_copy = copy.deepcopy(self.last_frame)
 
-        return self.cam_id, last_frame_copy
+    def get_frame(self):
+        if self.capture_mode == "trigger_sw":
+            self.cam.TriggerSoftware.Execute()
+
+        try:
+            frame = self.cam.GetNextImage()
+            status = not frame.IsIncomplete()
+        except:
+            status = False
+
+        if status:
+            self.last_frame = frame.GetData().reshape(self.height, self.width, -1)
+        else:
+            self.last_frame = None
+        frame.Release()
+
+        if self.capture_mode != "continuous":
+            print(self.cam_id, f"status: {status}")
+
+        return self.cam_id, self.last_frame
 
     def run(self):
-        """
-        Questo è il cuore del thread. Esegue la configurazione
-        e poi entra in un loop di acquisizione finché non viene terminato.
-        """
+        # Retrieve TL device nodemap and print device information
         nodemap_tldevice = self.cam.GetTLDeviceNodeMap()
         print_device_info(nodemap_tldevice)
 
         self.cam.Init()
         self.width, self.height = self.get_camera_resolution()
 
-        # Seleziona la modalità di cattura
         if self.capture_mode == "continuous":
             self.set_continuous()
         elif self.capture_mode == "trigger_sw":
@@ -156,50 +159,15 @@ class FlirCamera(threading.Thread):
         elif self.capture_mode == "trigger_gated":  # NUOVA MODALITÀ
             self.set_trigger_gated()
 
-        print(f"Camera {self.cam_id} started in '{self.capture_mode}' mode.")
-
-        # L'acquisizione è sempre "Continuous" a livello di SDK,
-        # ma il trigger ne governa il comportamento.
-        self.cam.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
+        print(self.cam_id, self.width, self.height)
+        self.cam.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)    # va sempre continuous anche col trigger
         self.cam.BeginAcquisition()
 
-        # Loop di acquisizione (il "produttore")
-        while not self.terminate.is_set():
-            try:
-                # GetNextImage attenderà un'immagine. Il timeout è importante.
-                # Se il trigger non arriva (es. in modalità gated con segnale basso),
-                # andrà in timeout, l'eccezione verrà gestita e il loop continuerà.
-                frame = self.cam.GetNextImage(1000)  # Timeout di 1 secondo
+        self.terminate.wait()
 
-                if not frame.IsIncomplete():
-                    # Converte l'immagine in un formato che OpenCV può usare (BGR8)
-                    converted_image = self.image_processor.Convert(frame, PySpin.PixelFormat_BGR8)
-
-                    # Ottieni i dati come array numpy
-                    image_data = converted_image.GetData()
-
-                    # Aggiorna l'ultimo frame in modo thread-safe
-                    with self.lock:
-                        self.last_frame = image_data.reshape((self.height, self.width, 3))
-
-                # Rilascia il buffer dell'immagine
-                frame.Release()
-
-            except PySpin.SpinnakerException as ex:
-                # Se GetNextImage va in timeout, è normale in modalità trigger.
-                # In questo caso, non facciamo nulla e il loop riprova.
-                if 'SPINNAKER_ERR_TIMEOUT' in str(ex):
-                    # print(f"Camera {self.cam_id}: Timeout waiting for image.")
-                    pass
-                else:
-                    print(f"Camera {self.cam_id}: Spinnaker error in run loop: {ex}")
-                    break
-
-        # Cleanup
         self.cam.EndAcquisition()
         self.load_defaults()
         self.cam.DeInit()
-        print(f"Camera {self.cam_id} thread finished.")
 
     def release(self):
         self.terminate.set()
@@ -208,7 +176,6 @@ class FlirCamera(threading.Thread):
         self.release()
 
     def __del__(self):
-        # La release esplicita è sempre preferibile a __del__
         self.release()
 
 
@@ -254,50 +221,66 @@ class FlirWrapper():
         self.release()
 
 
-def main(exposure, gain, capture_mode):
-    assert capture_mode in ["trigger_hw", "trigger_sw", "continuous", "trigger_gated"]
+def main(exposure, gain, capture_mode,
+         salva=True, save_dir="frames"):
+    assert capture_mode in ["trigger_hw", "trigger_sw",
+                            "continuous", "trigger_gated"]
 
-    cams = FlirWrapper(exposure=exposure, gain=gain, capture_mode=capture_mode)
+    cams = FlirWrapper(exposure=exposure,
+                       gain=gain,
+                       capture_mode=capture_mode)
+
+    cams_out = [[] for i in cams.camera_list]
 
     if not cams.caps:
         print("Uscita dal programma perché non sono state trovate telecamere.")
         return
 
+    while True:
+    # for asd in range(4):
+        t0 = time.time()
+        all_frames_data = cams.get_frames()
+
+        for i, (cam_id, frame) in enumerate(all_frames_data):
+            if frame is not None:
+                # cv2.imshow(f"Camera {cam_id}", frame)
+                cams_out[i].append([cam_id, frame])
+                # if salva:
+                    # save_frame_async(cam_id, frame, output_dir=save_dir)
+            elif capture_mode not in ["trigger_gated",
+                                       "trigger_hw", "trigger_sw"]:
+                print(f"Camera {cam_id}: Frame is None.")
+
+        if cv2.waitKey(1) in (27, ord('q')):
+            break
+
+        fps = 1 / (time.time() - t0)
+        print(f"\rFPS loop principale: {int(fps):03d}", end="")
+
+    print("\nChiusura in corso...")
     try:
-        while True:
-            t0 = time.time()
-            all_frames_data = cams.get_frames()
-
-            # Mostra i frame da tutte le camere
-            for cam_id, frame in all_frames_data:
-                if frame is not None:
-                    # Rinomina la finestra per evitare conflitti se ci sono più camere
-                    window_name = f"Camera {cam_id}"
-                    cv2.imshow(window_name, frame)
-                else:
-                    # In modalità trigger, potrebbe non esserci un frame se non è scattato
-                    if capture_mode in ["trigger_gated", "trigger_hw", "trigger_sw"]:
-                        pass  # È normale
-                    else:
-                        print(f"Camera {cam_id}: Frame is None.")
-
-            # Per la modalità continua o gated, un piccolo waitKey è necessario per aggiornare le finestre
-            k = cv2.waitKey(1)
-
-            if k == 27 or k == ord('q'):
-                break
-
-            t1 = time.time()
-            delta_t = t1 - t0
-            if delta_t > 0:
-                print(f"\rFPS loop principale: {int(1 / delta_t):03d}", end="")
-
-    finally:
-        # Assicurati che le risorse vengano rilasciate correttamente anche in caso di errore
-        print("\nChiusura in corso...")
         cams.release()
-        cv2.destroyAllWindows()
-        print("Programma terminato.")
+    except:
+        pass
+    cv2.destroyAllWindows()
+    print("Programma terminato.")
+
+    save_frame(cams_out, output_dir=save_dir)
+
+
+def save_frame(output_list, output_dir):
+    """Funzione che esegue realmente la scrittura su disco (run‐to‐completion)."""
+
+    for cam in output_list:
+        for i, data in enumerate(cam):
+            cam_id, frame = data
+            output_img = os.path.join(output_dir, cam_id)
+            os.makedirs(output_img, exist_ok=True)
+            filename = os.path.join(
+            output_img,
+            f"{cam_id}_{i:05d}.png"
+            )
+            cv2.imwrite(filename, frame)
 
 
 if __name__ == '__main__':
