@@ -189,8 +189,7 @@ class FlirWrapper(threading.Thread):
                  exposure: int,
                  gain: int,
                  capture_mode: str,
-                 output_queue: "queue.Queue",
-                 preview: bool = False):
+                 output_queue: "queue.Queue",):
         super().__init__(daemon=True)
         assert capture_mode in ["trigger_hw", "trigger_sw", "continuous", "trigger_gated"]
 
@@ -198,7 +197,6 @@ class FlirWrapper(threading.Thread):
         self.gain = gain
         self.capture_mode = capture_mode
         self.output_queue = output_queue
-        self.preview = preview
 
         self.stop_flag = threading.Event()
         self.frame_idx = defaultdict(int)
@@ -229,23 +227,15 @@ class FlirWrapper(threading.Thread):
                 if frame is None:
                     continue
 
-                # preview opzionale
-                if self.preview:
-                    cv2.imshow(f"Preview {cam_id}",
-                               cv2.resize(frame, (0, 0), fx=0.25, fy=0.25))
-                    cv2.waitKey(1)
-
                 # spinge nel buffer di output
                 try:
-                    self.output_queue.put_nowait(
-                        (cam_id, self.frame_idx[cam_id], frame))
+                    self.output_queue.put_nowait((cam_id, self.frame_idx[cam_id], frame))
                     self.frame_idx[cam_id] += 1
                 except queue.Full:
                     # se la coda è piena scarta il frame più vecchio
                     _ = self.output_queue.get_nowait()
                     self.output_queue.task_done()
-                    self.output_queue.put_nowait(
-                        (cam_id, self.frame_idx[cam_id], frame))
+                    self.output_queue.put_nowait((cam_id, self.frame_idx[cam_id], frame))
                     self.frame_idx[cam_id] += 1
 
             # (facoltativo) calcola FPS producer
@@ -292,16 +282,18 @@ def main(exposure: int,
 
     try:
         wrapper = FlirWrapper(exposure,
-                              gain,
-                              capture_mode,
-                              output_queue=queue_camera,
-                              preview=preview)
+                              gain, capture_mode,output_queue=queue_camera)
         wrapper.start()
 
         print("\nPremi CTRL-C per fermare…")
         while True:
             cam_id, idx, frame = queue_camera.get()   # blocca finché c’è un frame
             queue_camera.task_done()                  # ✱  segnala l’avvenuto prelievo
+
+            # preview opzionale
+            if preview:
+                cv2.imshow(f"Preview {cam_id}",cv2.resize(frame, (0, 0), fx=0.25, fy=0.25))
+                cv2.waitKey(1)
 
             # ── Salvataggio su disco ────────────────────────────────
             if save:
