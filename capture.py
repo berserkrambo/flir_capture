@@ -1,16 +1,15 @@
 import time
 import PySpin
 import threading
-from threading import Lock
-import copy
+
 from path import Path
 import cv2
 import numpy as np
-import socket
-import pickle
+from collections import defaultdict
 
-from flir_utils import print_device_info
-
+from utils import print_device_info
+import queue
+from frame_writer import FrameWriter
 
 class FlirCamera(threading.Thread):
     def __init__(self, camera, exposure, gain, capture_mode):
@@ -20,8 +19,6 @@ class FlirCamera(threading.Thread):
         self.capture_mode = capture_mode
         self.terminate = threading.Event()
 
-        # self.lock = Lock()
-        # self.queue = queue
         self.exposure = exposure
         self.gain = gain
         self.width = None
@@ -122,6 +119,7 @@ class FlirCamera(threading.Thread):
 
 
     def get_frame(self):
+
         if self.capture_mode == "trigger_sw":
             self.cam.TriggerSoftware.Execute()
 
@@ -133,9 +131,10 @@ class FlirCamera(threading.Thread):
 
         if status:
             self.last_frame = frame.GetData().reshape(self.height, self.width, -1)
+            frame.Release()
         else:
             self.last_frame = None
-        frame.Release()
+
 
         if self.capture_mode != "continuous":
             print(self.cam_id, f"status: {status}")
@@ -148,6 +147,8 @@ class FlirCamera(threading.Thread):
         print_device_info(nodemap_tldevice)
 
         self.cam.Init()
+        self.nodemap = self.cam.GetNodeMap()
+
         self.width, self.height = self.get_camera_resolution()
 
         if self.capture_mode == "continuous":
@@ -156,7 +157,7 @@ class FlirCamera(threading.Thread):
             self.set_trigger_sw()
         elif self.capture_mode == "trigger_hw":
             self.set_trigger_hw()
-        elif self.capture_mode == "trigger_gated":  # NUOVA MODALITÀ
+        elif self.capture_mode == "trigger_gated":
             self.set_trigger_gated()
 
         print(self.cam_id, self.width, self.height)
@@ -171,6 +172,7 @@ class FlirCamera(threading.Thread):
 
     def release(self):
         self.terminate.set()
+        self.join()
 
     def stop(self):
         self.release()
@@ -179,108 +181,154 @@ class FlirCamera(threading.Thread):
         self.release()
 
 
-class FlirWrapper():
-    def __init__(self, exposure, gain, capture_mode):
-        # Aggiungiamo la nuova modalità all'elenco di quelle valide
+class FlirWrapper(threading.Thread):
+    """
+    Producer: lancia le FlirCamera, raccoglie i frame e li spinge in output_queue.
+    """
+    def __init__(self,
+                 exposure: int,
+                 gain: int,
+                 capture_mode: str,
+                 output_queue: "queue.Queue",
+                 preview: bool = False):
+        super().__init__(daemon=True)
         assert capture_mode in ["trigger_hw", "trigger_sw", "continuous", "trigger_gated"]
+
+        self.exposure = exposure
+        self.gain = gain
         self.capture_mode = capture_mode
+        self.output_queue = output_queue
+        self.preview = preview
+
+        self.stop_flag = threading.Event()
+        self.frame_idx = defaultdict(int)
+
+        # Inizializza il sistema e le telecamere -------------------
         self.system = PySpin.System.GetInstance()
-
         self.camera_list = self.system.GetCameras()
-        if not self.camera_list.GetSize():
-            print("Nessuna camera trovata. Assicurati che siano collegate e che i driver siano installati.")
-            self.caps = []
-            return
+        if self.camera_list.GetSize() == 0:
+            raise RuntimeError("Nessuna camera FLIR trovata.")
 
-        self.caps = [FlirCamera(cam, exposure, gain, self.capture_mode) for cam in self.camera_list]
+        self.cams = [FlirCamera(cam, exposure, gain, capture_mode)
+                     for cam in self.camera_list]
+        for c in self.cams:
+            c.start()
+            self.frame_idx[c.cam_id] = 0
 
-        [c.start() for c in self.caps]
-        print("Camere in fase di avvio, attesa di 2 secondi per la stabilizzazione...")
+        # piccola pausa per stabilizzazione
         time.sleep(2)
 
-        print("Wrapper pronto.")
+    # --------------------------------------------------------------
+    def run(self):
+        while not self.stop_flag.is_set():
+            t0 = time.time()
 
-    def get_frames(self):
-        return [c.get_frame() for c in self.caps]
+            # raccogli un frame da ciascuna camera
+            for cam in self.cams:
+                cam_id, frame = cam.get_frame()
+                if frame is None:
+                    continue
 
-    def release(self):
-        if hasattr(self, 'caps'):
-            [c.release() for c in self.caps]
-            [c.join() for c in self.caps]  # Attende la fine dei thread
-            del self.caps
-        if hasattr(self, 'camera_list'):
-            self.camera_list.Clear()
-        if hasattr(self, 'system'):
-            self.system.ReleaseInstance()
-        print("FlirWrapper released.")
+                # preview opzionale
+                if self.preview:
+                    cv2.imshow(f"Preview {cam_id}",
+                               cv2.resize(frame, (0, 0), fx=0.25, fy=0.25))
+                    cv2.waitKey(1)
 
+                # spinge nel buffer di output
+                try:
+                    self.output_queue.put_nowait(
+                        (cam_id, self.frame_idx[cam_id], frame))
+                    self.frame_idx[cam_id] += 1
+                except queue.Full:
+                    # se la coda è piena scarta il frame più vecchio
+                    _ = self.output_queue.get_nowait()
+                    self.output_queue.task_done()
+                    self.output_queue.put_nowait(
+                        (cam_id, self.frame_idx[cam_id], frame))
+                    self.frame_idx[cam_id] += 1
+
+            # (facoltativo) calcola FPS producer
+            fps = 1 / (time.time() - t0)
+            print(f"\rProducer FPS: {fps:5.1f}", end="")
+
+    # --------------------------------------------------------------
     def stop(self):
-        self.release()
+        """
+        Ferma wrapper + telecamere e rilascia le risorse PySpin.
+        """
+        self.stop_flag.set()
+        for c in self.cams:
+            c.stop()
+        self.join()
 
-    def __del__(self):
-        self.release()
+        self.camera_list.Clear()
+        self.system.ReleaseInstance()
+        cv2.destroyAllWindows()
+        print("\nFlirWrapper chiuso.")
 
 
-def main(exposure, gain, capture_mode,
-         salva=True, save_dir="frames"):
+def main(exposure: int,
+         gain: int,
+         capture_mode: str,
+         save: bool = True,
+         save_dir: str = "frames",
+         preview: bool = True):
+    """
+    Avvia un FlirWrapper (producer) che inserisce i frame in `queue_camera`;
+    il main thread li consuma (preview) e, se `save == True`, li inoltra
+    in `queue_writer` dove un FrameWriter (consumer) li salva su disco.
+    """
     assert capture_mode in ["trigger_hw", "trigger_sw",
                             "continuous", "trigger_gated"]
 
-    cams = FlirWrapper(exposure=exposure,
-                       gain=gain,
-                       capture_mode=capture_mode)
+    queue_camera = queue.Queue(maxsize=256)     # producer → main
+    queue_writer = queue.Queue(maxsize=256)     # main     → writer (opzionale)
 
-    cams_out = [[] for i in cams.camera_list]
+    writer = None
+    if save:
+        writer = FrameWriter(queue_writer, save_dir)
+        writer.start()
 
-    if not cams.caps:
-        print("Uscita dal programma perché non sono state trovate telecamere.")
-        return
-
-    while True:
-    # for asd in range(4):
-        t0 = time.time()
-        all_frames_data = cams.get_frames()
-
-        for i, (cam_id, frame) in enumerate(all_frames_data):
-            if frame is not None:
-                # cv2.imshow(f"Camera {cam_id}", frame)
-                cams_out[i].append([cam_id, frame])
-                # if salva:
-                    # save_frame_async(cam_id, frame, output_dir=save_dir)
-            elif capture_mode not in ["trigger_gated",
-                                       "trigger_hw", "trigger_sw"]:
-                print(f"Camera {cam_id}: Frame is None.")
-
-        if cv2.waitKey(1) in (27, ord('q')):
-            break
-
-        fps = 1 / (time.time() - t0)
-        print(f"\rFPS loop principale: {int(fps):03d}", end="")
-
-    print("\nChiusura in corso...")
     try:
-        cams.release()
-    except:
-        pass
-    cv2.destroyAllWindows()
-    print("Programma terminato.")
+        wrapper = FlirWrapper(exposure,
+                              gain,
+                              capture_mode,
+                              output_queue=queue_camera,
+                              preview=preview)
+        wrapper.start()
 
-    save_frame(cams_out, output_dir=save_dir)
+        print("\nPremi CTRL-C per fermare…")
+        while True:
+            cam_id, idx, frame = queue_camera.get()   # blocca finché c’è un frame
+            queue_camera.task_done()                  # ✱  segnala l’avvenuto prelievo
 
+            # ── Salvataggio su disco ────────────────────────────────
+            if save:
+                # copia → il writer può lavorare in sicurezza
+                queue_writer.put((cam_id, idx, frame.copy()))
 
-def save_frame(output_list, output_dir):
-    """Funzione che esegue realmente la scrittura su disco (run‐to‐completion)."""
+    except KeyboardInterrupt:
+        print("\nStop richiesto dall’utente.")
 
-    for cam in output_list:
-        for i, data in enumerate(cam):
-            cam_id, frame = data
-            output_img = os.path.join(output_dir, cam_id)
-            os.makedirs(output_img, exist_ok=True)
-            filename = os.path.join(
-            output_img,
-            f"{cam_id}_{i:05d}.png"
-            )
-            cv2.imwrite(filename, frame)
+    finally:
+        # ───── spegni tutto in ordine ──────────────────────────────
+        print("Chiusura in corso…")
+        wrapper.stop()                # ferma producer + telecamere
+
+        # svuota (senza bloccare) gli eventuali frame rimasti nella queue_camera
+        while not queue_camera.empty():
+            queue_camera.get_nowait()
+            queue_camera.task_done()
+
+        if save and writer:
+            queue_writer.join()       # aspetta che il writer finisca
+            writer.stop()
+            writer.join()
+
+        cv2.destroyAllWindows()
+        print("Programma terminato.")
+
 
 
 if __name__ == '__main__':
@@ -302,4 +350,4 @@ if __name__ == '__main__':
     gain = 10
 
 
-    main(exposure=exposure, gain=gain, capture_mode=capture_mode)
+    main(exposure=exposure, gain=gain, capture_mode=capture_mode, save=True, save_dir="frames", preview=True)
